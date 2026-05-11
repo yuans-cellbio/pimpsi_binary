@@ -36,8 +36,10 @@ def test_recording_reads_versions_lazily_and_returns_row_major_frames(
 
     np.testing.assert_array_equal(recording.get_variance(1), variance_frames[1])
     np.testing.assert_array_equal(recording.get_intensity(1), intensity_frames[1])
-    assert recording.get_intensity(1).shape == (2, 3)
-    assert recording.get_intensity(1).flags.c_contiguous
+    intensity = recording.get_intensity(1)
+    assert intensity.shape == (2, 3)
+    assert not intensity.flags.writeable
+    assert not intensity.flags.owndata
 
 
 def test_recording_validates_file_size(tmp_path):

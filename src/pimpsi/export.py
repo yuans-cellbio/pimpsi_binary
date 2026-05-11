@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import csv
 from pathlib import Path
 
@@ -84,6 +85,7 @@ def export_image_set(
     colormap: ColorMapSetting = "gray",
     color_limits: ColorLimitSetting = None,
     rois: list[Roi] | None = None,
+    intensity_mask: Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None = None,
 ) -> list[Path]:
     """Export selected images next to the source ``.dat`` with deterministic names."""
     if not frames:
@@ -107,6 +109,7 @@ def export_image_set(
                     channel=channel,
                     color=color,
                     kind="single_frame",
+                    masked=bool(rois and intensity_mask is not None),
                 )
                 _write_export_image(
                     path,
@@ -116,6 +119,7 @@ def export_image_set(
                     colormap=_channel_colormap(colormap, channel),
                     color_limits=_channel_color_limits(color_limits, channel),
                     rois=rois,
+                    masked_rois=_masked_rois(recording, frame_index, rois, intensity_mask),
                 )
                 exported.append(path)
 
@@ -127,6 +131,7 @@ def export_image_set(
                 channel="-".join(channels),
                 color=color,
                 kind="stacked",
+                masked=False,
             )
             stack = np.asarray(
                 [
@@ -150,6 +155,7 @@ def export_image_set(
                     channel=channel,
                     color=color,
                     kind="stacked",
+                    masked=bool(rois and intensity_mask is not None),
                 )
                 _write_export_stack(
                     path,
@@ -160,6 +166,7 @@ def export_image_set(
                     colormap=_channel_colormap(colormap, channel),
                     color_limits=_channel_color_limits(color_limits, channel),
                     rois=rois,
+                    intensity_mask=intensity_mask,
                     frames=frames,
                 )
                 exported.append(path)
@@ -176,6 +183,7 @@ def export_image_set(
                 channel=channel,
                 color=color,
                 kind="averaged",
+                masked=bool(rois and intensity_mask is not None),
             )
             _write_export_image(
                 path,
@@ -185,6 +193,7 @@ def export_image_set(
                 colormap=_channel_colormap(colormap, channel),
                 color_limits=_channel_color_limits(color_limits, channel),
                 rois=rois,
+                masked_rois=_masked_rois_for_average(recording, frames, rois, intensity_mask),
             )
             exported.append(path)
 
@@ -268,10 +277,20 @@ def _write_export_image(
     colormap: str,
     color_limits: tuple[float, float] | None,
     rois: list[Roi] | None,
+    masked_rois: list[tuple[Roi, NDArray[np.bool_]]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if color:
-        tifffile.imwrite(path, _colorize(image, colormap=colormap, color_limits=color_limits, rois=rois))
+        tifffile.imwrite(
+            path,
+            _colorize(
+                image,
+                colormap=colormap,
+                color_limits=color_limits,
+                rois=rois,
+                masked_rois=masked_rois,
+            ),
+        )
         return
     tifffile.imwrite(path, _image_export_plane(recording, image))
 
@@ -286,6 +305,7 @@ def _write_export_stack(
     colormap: str,
     color_limits: tuple[float, float] | None,
     rois: list[Roi] | None,
+    intensity_mask: Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None,
     frames: list[int],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -296,7 +316,16 @@ def _write_export_stack(
     }
     if color:
         stack = np.asarray(
-            [_colorize(image, colormap=colormap, color_limits=color_limits, rois=rois) for image in images],
+            [
+                _colorize(
+                    image,
+                    colormap=colormap,
+                    color_limits=color_limits,
+                    rois=rois,
+                    masked_rois=_masked_rois(recording, frame_index, rois, intensity_mask),
+                )
+                for image, frame_index in zip(images, frames, strict=True)
+            ],
             dtype=np.uint8,
         )
         tifffile.imwrite(path, stack, photometric="rgb", metadata={**metadata, "axes": "TYX" + _SAMPLE_AXIS})
@@ -312,10 +341,12 @@ def _image_export_name(
     channel: str,
     color: bool,
     kind: str,
+    masked: bool,
 ) -> str:
     frame_part = f"frame_{frames[0] + 1}" if len(frames) == 1 else f"frames_{frames[0] + 1}-{frames[-1] + 1}"
     image_part = "color_image" if color else "gray_image"
-    return f"{basename}_{frame_part}_{channel}_{image_part}_{kind}.tif"
+    mask_part = "_masked" if masked else ""
+    return f"{basename}_{frame_part}_{channel}_{image_part}{mask_part}_{kind}.tif"
 
 
 def _image_export_plane(recording: PimRecording, image: NDArray[np.float64]) -> NDArray[np.float32]:
@@ -341,13 +372,47 @@ def _colorize(
     colormap: str,
     color_limits: tuple[float, float] | None,
     rois: list[Roi] | None,
+    masked_rois: list[tuple[Roi, NDArray[np.bool_]]] | None = None,
 ) -> NDArray[np.uint8]:
     gray = _normalize_uint8(image, limits=color_limits)
     rgb = _apply_colormap(gray, colormap)
     for roi in rois or []:
         boundary = _mask_boundary(roi.to_mask(image.shape))
+        rgb[boundary] = (230, 230, 230) if masked_rois else _hex_to_rgb(roi.color)
+    for roi, mask in masked_rois or []:
+        boundary = _mask_boundary(mask)
         rgb[boundary] = _hex_to_rgb(roi.color)
     return rgb
+
+
+def _masked_rois(
+    recording: PimRecording,
+    frame_index: int,
+    rois: list[Roi] | None,
+    intensity_mask: Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None,
+) -> list[tuple[Roi, NDArray[np.bool_]]] | None:
+    if intensity_mask is None or not rois:
+        return None
+    intensity = recording.get_intensity(frame_index)
+    include = np.asarray(intensity_mask(intensity), dtype=bool)
+    return [(roi, roi.to_mask(intensity.shape) & include) for roi in rois]
+
+
+def _masked_rois_for_average(
+    recording: PimRecording,
+    frames: list[int],
+    rois: list[Roi] | None,
+    intensity_mask: Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None,
+) -> list[tuple[Roi, NDArray[np.bool_]]] | None:
+    if intensity_mask is None or not rois or not frames:
+        return None
+    accumulator = None
+    for frame_index in frames:
+        intensity = recording.get_intensity(frame_index)
+        accumulator = intensity.copy() if accumulator is None else accumulator + intensity
+    assert accumulator is not None
+    include = np.asarray(intensity_mask(accumulator / len(frames)), dtype=bool)
+    return [(roi, roi.to_mask(include.shape) & include) for roi in rois]
 
 
 def _apply_colormap(gray: NDArray[np.uint8], colormap: str) -> NDArray[np.uint8]:

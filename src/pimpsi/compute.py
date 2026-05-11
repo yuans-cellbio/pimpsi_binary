@@ -35,7 +35,6 @@ def calculate_perfusion(
     variance_sqrt = _signed_sqrt(variance)
     intensity_array = np.asarray(intensity, dtype=np.float64)
     denominator = float(coherence_factor) * variance_sqrt
-    denominator = np.where(denominator == 0.0, np.finfo(np.float64).eps, denominator)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         perfusion = float(signal_gain) * ((intensity_array / denominator) - 1.0)
@@ -83,4 +82,3 @@ def block_average(image: ArrayLike, block_size: int) -> NDArray[np.float64]:
         return np.empty((0, 0), dtype=np.float64)
 
     return trimmed.reshape(block_height, block_size, block_width, block_size).mean(axis=(1, 3))
-

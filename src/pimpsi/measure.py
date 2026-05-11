@@ -196,7 +196,12 @@ def _collect_roi_toi_stats(
         variance = recording.get_variance(frame_index)
         valid_mask = roi_mask
         if intensity_mask is not None:
-            valid_mask = roi_mask & np.asarray(intensity_mask(intensity), dtype=bool)
+            mask_array = np.asarray(intensity_mask(intensity), dtype=bool)
+            if mask_array.shape != intensity.shape:
+                raise ValueError(
+                    f"intensity_mask returned shape {mask_array.shape}, expected {intensity.shape}"
+                )
+            valid_mask = roi_mask & mask_array
 
         frame_count = int(valid_mask.sum())
         if frame_count == 0:

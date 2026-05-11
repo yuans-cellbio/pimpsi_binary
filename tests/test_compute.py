@@ -33,6 +33,18 @@ def test_calculate_perfusion_uses_documented_formula_and_clips_upper_bound():
     np.testing.assert_allclose(perfusion, np.array([[990.0, 3000.0]]))
 
 
+def test_calculate_perfusion_allows_infinite_unclipped_values():
+    perfusion = calculate_perfusion(
+        variance=np.array([0.0]),
+        intensity=np.array([100.0]),
+        coherence_factor=0.5,
+        signal_gain=10.0,
+        clip_upper=None,
+    )
+
+    assert np.isposinf(perfusion[0])
+
+
 def test_calculate_perfusion_keeps_negative_variance_behavior():
     perfusion = calculate_perfusion(
         variance=np.array([-4.0]),
@@ -71,4 +83,3 @@ def test_block_average_drops_incomplete_edge_blocks():
             ]
         ),
     )
-

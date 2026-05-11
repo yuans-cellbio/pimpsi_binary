@@ -113,16 +113,11 @@ class PimRecording:
 
     def get_variance(self, frame_index: int) -> NDArray[np.float64]:
         self._validate_frame_index(frame_index)
-        return np.array(self._data[frame_index].T, dtype=np.float64, order="C", copy=True)
+        return np.asarray(self._data[frame_index].T, dtype=np.float64)
 
     def get_intensity(self, frame_index: int) -> NDArray[np.float64]:
         self._validate_frame_index(frame_index)
-        return np.array(
-            self._data[self.header.n_frames + frame_index].T,
-            dtype=np.float64,
-            order="C",
-            copy=True,
-        )
+        return np.asarray(self._data[self.header.n_frames + frame_index].T, dtype=np.float64)
 
     def calculate_perfusion(
         self,

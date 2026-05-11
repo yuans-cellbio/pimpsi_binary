@@ -14,7 +14,7 @@ from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 from pimpsi.gui.image_view import ImageView
-from pimpsi.gui.main_window import MainWindow, _vertices_from_item
+from pimpsi.gui.main_window import IntensityMaskSettings, MainWindow, _vertices_from_item
 from pimpsi.gui.workers import LazyFrameProvider
 from pimpsi.roi import Roi
 
@@ -96,11 +96,12 @@ def test_main_window_set_recording_displays_current_frame_lazily(qapp):
     window.frame_slider.setValue(3)
     window.mode_combo.setCurrentText("perfusion")
 
-    assert recording.intensity_calls == [0, 2]
+    assert recording.intensity_calls == [0, 0, 2]
     assert recording.variance_calls == []
-    assert recording.perfusion_calls == [(0, 3000.0), (2, 3000.0), (2, 3000.0)]
+    assert recording.perfusion_calls == [(0, 3000.0), (2, 3000.0)]
     assert window.frame_slider.maximum() == 4
     assert "3/4" in window.status_label.text()
+    assert "top intensity" in window.status_label.text()
     window.close()
 
 
@@ -203,6 +204,98 @@ def test_main_window_trace_uses_selected_roi_and_channel_lazily(qapp):
 
     assert recording.variance_calls == [0, 1, 2, 3]
     assert recording.intensity_calls == []
+    assert recording.perfusion_calls == []
+    window.close()
+
+
+def test_main_window_trace_applies_intensity_mask(qapp):
+    class MaskRecording(FakeRecording):
+        def get_intensity(self, frame_index):
+            self.intensity_calls.append(frame_index)
+            return np.asarray([[1.0, 10.0, 100.0], [2.0, 20.0, 200.0]])
+
+    recording = MaskRecording()
+    window = MainWindow()
+    window.set_recording(recording)
+    window.intensity_mask_settings = IntensityMaskSettings(True, 5.0, 20.0)
+    roi = Roi(id="roi_001", label="all", shape_type="rectangle", vertices_xy=[(0.0, 0.0), (3.0, 2.0)])
+
+    values = window._trace_values_for_roi(roi, "intensity", [0], LazyFrameProvider(recording))
+
+    assert values == pytest.approx([15.0])
+    window.close()
+
+
+def test_masked_roi_overlay_is_shown_in_both_main_viewers(qapp):
+    recording = FakeRecording()
+    window = MainWindow()
+    window.set_recording(recording)
+    window.add_roi("rectangle")
+
+    window._trace_mask_controls_changed(IntensityMaskSettings(True, 100.0, 101.0))
+
+    assert window.top_masked_roi_item is not None
+    assert window.secondary_masked_roi_item is not None
+    window.close()
+
+
+def test_main_window_persists_intensity_mask_settings_in_session(qapp):
+    recording = FakeRecording()
+    window = MainWindow()
+    window.set_recording(recording)
+
+    window._trace_mask_controls_changed(IntensityMaskSettings(True, 100.0, 200.0))
+
+    profile = window.session.processing_profile
+    assert profile.intensity_mask_enabled is True
+    assert profile.intensity_mask_lower == 100.0
+    assert profile.intensity_mask_upper == 200.0
+    window.close()
+
+
+def test_main_window_perfusion_trace_uses_mean_first_roi_measurement(qapp):
+    class NonuniformRecording(FakeRecording):
+        def __init__(self):
+            super().__init__()
+            self.intensity_frames = [
+                np.array([[10.0, 100.0, 30.0], [40.0, 50.0, 60.0]]),
+                np.array([[20.0, 200.0, 40.0], [50.0, 60.0, 70.0]]),
+                np.array([[30.0, 300.0, 50.0], [60.0, 70.0, 80.0]]),
+                np.array([[40.0, 400.0, 60.0], [70.0, 80.0, 90.0]]),
+            ]
+            self.variance_frames = [
+                np.array([[1.0, 100.0, 9.0], [16.0, 25.0, 36.0]]),
+                np.array([[4.0, 400.0, 16.0], [25.0, 36.0, 49.0]]),
+                np.array([[9.0, 900.0, 25.0], [36.0, 49.0, 64.0]]),
+                np.array([[16.0, 1600.0, 36.0], [49.0, 64.0, 81.0]]),
+            ]
+
+        def get_intensity(self, frame_index):
+            self.intensity_calls.append(frame_index)
+            return self.intensity_frames[frame_index]
+
+        def get_variance(self, frame_index):
+            self.variance_calls.append(frame_index)
+            return self.variance_frames[frame_index]
+
+    recording = NonuniformRecording()
+    window = MainWindow()
+    window.set_recording(recording)
+    roi = Roi(id="roi_001", label="all", shape_type="rectangle", vertices_xy=[(0.0, 0.0), (3.0, 2.0)])
+    recording.intensity_calls.clear()
+    recording.variance_calls.clear()
+    recording.perfusion_calls.clear()
+
+    values = window._trace_values_for_roi(roi, "perfusion", [0], LazyFrameProvider(recording))
+
+    mean_first = 10.0 * (
+        recording.intensity_frames[0].mean() / (0.5 * np.sqrt(recording.variance_frames[0].mean())) - 1.0
+    )
+    pixelwise_mean = 10.0 * (
+        recording.intensity_frames[0] / (0.5 * np.sqrt(recording.variance_frames[0])) - 1.0
+    ).mean()
+    assert values == pytest.approx([mean_first])
+    assert values[0] != pytest.approx(pixelwise_mean)
     assert recording.perfusion_calls == []
     window.close()
 
@@ -323,20 +416,19 @@ def test_polygon_roi_vertices_read_from_pyqtgraph_handles(qapp):
     window.close()
 
 
-def test_bottom_roi_edit_syncs_to_top_roi(qapp):
+def test_bottom_roi_item_is_view_only(qapp):
     recording = FakeRecording()
     window = MainWindow()
     window.set_recording(recording)
     window.add_roi("rectangle")
     roi_id = window.session.rois[0].id
-    bottom_item = window.secondary_roi_items[roi_id]
+    bottom_items = window.secondary_roi_items[roi_id]
 
-    bottom_item.setPos([1.0, 1.0])
-    QtWidgets.QApplication.processEvents()
-
-    assert window.session.rois[0].vertices_xy[0] == (1.0, 1.0)
-    assert window.roi_items[roi_id].pos().x() == 1.0
-    assert window.roi_items[roi_id].pos().y() == 1.0
+    assert bottom_items
+    assert all(not hasattr(item, "setSize") for item in bottom_items)
+    assert window.session.rois[0].vertices_xy[0] == (0.0, 0.0)
+    assert window.roi_items[roi_id].pos().x() == 0.0
+    assert window.roi_items[roi_id].pos().y() == 0.0
     window.close()
 
 

@@ -112,3 +112,18 @@ def test_measurement_can_exclude_pixels_with_intensity_mask(tmp_path):
 
     assert result.value == 2.0
 
+
+def test_measurement_rejects_malformed_intensity_mask_shape(tmp_path):
+    path = tmp_path / "recording.dat"
+    make_pimsoft_file(path)
+    recording = PimRecording.open(path)
+    roi = Roi(id="roi_001", label="all", shape_type="rectangle", vertices_xy=[(0.0, 0.0), (3.0, 2.0)])
+    toi = Toi(id="toi_001", label="frame0", frame_start=0, frame_end=1)
+
+    with pytest.raises(ValueError, match="intensity_mask returned shape"):
+        measure_roi_toi(
+            recording,
+            roi,
+            toi,
+            intensity_mask=lambda intensity: np.array([True, False]),
+        )

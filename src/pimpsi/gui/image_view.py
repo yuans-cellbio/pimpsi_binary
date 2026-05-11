@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 import pyqtgraph as pg
@@ -27,6 +29,7 @@ FALLBACK_COLORS = {
     "turbo": [(48, 18, 59), (50, 101, 255), (39, 216, 175), (245, 222, 58), (180, 4, 38)],
     "cividis": [(0, 32, 77), (40, 79, 110), (101, 120, 110), (170, 159, 101), (253, 234, 69)],
 }
+HAS_MATPLOTLIB = find_spec("matplotlib") is not None
 
 
 class ImageView(QtWidgets.QWidget):
@@ -63,9 +66,13 @@ class ImageView(QtWidgets.QWidget):
 
     def set_colormap(self, name: str) -> None:
         mapped_name = COLORMAP_ALIASES.get(name, name)
-        try:
-            colormap = pg.colormap.getFromMatplotlib(mapped_name)
-        except Exception:
+        colormap = None
+        if HAS_MATPLOTLIB:
+            try:
+                colormap = pg.colormap.getFromMatplotlib(mapped_name)
+            except Exception:
+                colormap = None
+        if colormap is None:
             colors = FALLBACK_COLORS.get(mapped_name)
             if colors is None:
                 colormap = pg.colormap.get(mapped_name)

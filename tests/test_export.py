@@ -5,6 +5,7 @@ import numpy as np
 import tifffile
 
 from pimpsi.export import export_image_set
+from pimpsi.roi import Roi
 
 
 @dataclass(frozen=True)
@@ -127,3 +128,32 @@ def test_color_export_accepts_per_channel_mapping_settings(tmp_path):
     perfusion = next(image for name, image in images.items() if "_perfusion_" in name)
     np.testing.assert_array_equal(intensity[0, 0], np.asarray([68, 1, 84], dtype=np.uint8))
     np.testing.assert_array_equal(perfusion[0, 0], np.asarray([0, 0, 4], dtype=np.uint8))
+
+
+def test_color_roi_export_draws_masked_roi_outline_and_names_file(tmp_path):
+    recording = FakeRecording(tmp_path / "sample.dat")
+    roi = Roi(
+        id="roi_001",
+        label="all",
+        shape_type="rectangle",
+        vertices_xy=[(0.0, 0.0), (3.0, 2.0)],
+        color="#ff0000",
+    )
+
+    [path] = export_image_set(
+        recording,
+        frames=[0],
+        channels=["intensity"],
+        output_dir=tmp_path,
+        single_frame=True,
+        color=True,
+        colormap="gray",
+        color_limits=(0.0, 4096.0),
+        rois=[roi],
+        intensity_mask=lambda intensity: (intensity >= 128.0) & (intensity <= 2048.0),
+    )
+
+    image = tifffile.imread(path)
+    assert "_masked_" in path.name
+    np.testing.assert_array_equal(image[0, 0], np.asarray([230, 230, 230], dtype=np.uint8))
+    np.testing.assert_array_equal(image[0, 1], np.asarray([255, 0, 0], dtype=np.uint8))

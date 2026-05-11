@@ -93,6 +93,83 @@ def test_cli_measure_writes_reproducible_csv_from_saved_session(tmp_path):
     assert rows[0]["toi_id"] == "toi_001"
 
 
+def test_cli_measure_applies_session_intensity_mask(tmp_path):
+    variance_frames = [
+        np.array([[1.0, 4.0], [9.0, 16.0]]),
+        np.array([[25.0, 36.0], [49.0, 64.0]]),
+    ]
+    intensity_frames = [
+        np.array([[10.0, 20.0], [30.0, 40.0]]),
+        np.array([[50.0, 60.0], [70.0, 80.0]]),
+    ]
+    recording_path = tmp_path / "recording.dat"
+    make_pimsoft_file(
+        recording_path,
+        variance_frames=variance_frames,
+        intensity_frames=intensity_frames,
+        coherence_factor=1.0,
+        signal_gain=1.0,
+    )
+    recording = PimRecording.open(recording_path)
+    session = AnalysisSession.from_recording(recording)
+    session.processing_profile.intensity_mask_enabled = True
+    session.processing_profile.intensity_mask_lower = 30.0
+    session.processing_profile.intensity_mask_upper = 70.0
+    session.rois.append(
+        Roi(id="roi_001", label="all", shape_type="rectangle", vertices_xy=[(0.0, 0.0), (2.0, 2.0)])
+    )
+    session.tois.append(Toi(id="toi_001", label="both", frame_start=0, frame_end=2))
+    session_path = tmp_path / "recording.pimpsi.json"
+    session.save(session_path)
+    out_path = tmp_path / "measurements.csv"
+
+    completed = _run_cli("measure", str(recording_path), "--session", str(session_path), "--out", str(out_path))
+
+    assert completed.returncode == 0, completed.stderr
+    rows = list(csv.DictReader(out_path.open()))
+    expected = (50.0 / np.sqrt(27.0)) - 1.0
+    assert float(rows[0]["value"]) == pytest.approx(expected)
+    assert rows[0]["n_pixels"] == "4"
+
+
+def test_cli_measure_mask_flags_override_session(tmp_path):
+    recording_path = tmp_path / "recording.dat"
+    make_pimsoft_file(
+        recording_path,
+        variance_frames=[np.array([[1.0, 4.0], [9.0, 16.0]])],
+        intensity_frames=[np.array([[10.0, 20.0], [30.0, 40.0]])],
+        coherence_factor=1.0,
+        signal_gain=1.0,
+    )
+    recording = PimRecording.open(recording_path)
+    session = AnalysisSession.from_recording(recording)
+    session.rois.append(
+        Roi(id="roi_001", label="all", shape_type="rectangle", vertices_xy=[(0.0, 0.0), (2.0, 2.0)])
+    )
+    session.tois.append(Toi(id="toi_001", label="frame0", frame_start=0, frame_end=1))
+    session_path = tmp_path / "recording.pimpsi.json"
+    session.save(session_path)
+    out_path = tmp_path / "measurements.csv"
+
+    completed = _run_cli(
+        "measure",
+        str(recording_path),
+        "--session",
+        str(session_path),
+        "--out",
+        str(out_path),
+        "--intensity-mask-lower",
+        "20",
+        "--intensity-mask-upper",
+        "30",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    rows = list(csv.DictReader(out_path.open()))
+    expected = (25.0 / np.sqrt(6.5)) - 1.0
+    assert float(rows[0]["value"]) == pytest.approx(expected)
+
+
 def test_cli_measure_can_write_multiple_metrics(tmp_path):
     recording_path = tmp_path / "recording.dat"
     make_pimsoft_file(recording_path)
@@ -148,4 +225,3 @@ def test_cli_measure_rejects_source_mismatch(tmp_path):
 
     assert completed.returncode == 1
     assert "source_sha256" in completed.stderr
-

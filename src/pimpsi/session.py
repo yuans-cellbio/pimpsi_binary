@@ -20,6 +20,9 @@ class ProcessingProfile:
     negative_variance_policy: str = "signed_contrast"
     roi_summary_policy: str = "mean_intensity_variance_then_perfusion"
     intensity_mask_policy: str = "exclude_pixels"
+    intensity_mask_enabled: bool = False
+    intensity_mask_lower: float = 0.0
+    intensity_mask_upper: float = 1.0
     spatial_downscale: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -28,6 +31,9 @@ class ProcessingProfile:
             "negative_variance_policy": self.negative_variance_policy,
             "roi_summary_policy": self.roi_summary_policy,
             "intensity_mask_policy": self.intensity_mask_policy,
+            "intensity_mask_enabled": self.intensity_mask_enabled,
+            "intensity_mask_lower": self.intensity_mask_lower,
+            "intensity_mask_upper": self.intensity_mask_upper,
             "spatial_downscale": self.spatial_downscale,
         }
 
@@ -43,6 +49,9 @@ class ProcessingProfile:
                 "mean_intensity_variance_then_perfusion",
             ),
             intensity_mask_policy=data.get("intensity_mask_policy", "exclude_pixels"),
+            intensity_mask_enabled=data.get("intensity_mask_enabled", False),
+            intensity_mask_lower=data.get("intensity_mask_lower", 0.0),
+            intensity_mask_upper=data.get("intensity_mask_upper", 1.0),
             spatial_downscale=data.get("spatial_downscale"),
         )
 
@@ -109,4 +118,3 @@ class AnalysisSession:
             source_file_size=recording.path.stat().st_size,
             pimsoft_binary_version=recording.header.file_version,
         )
-

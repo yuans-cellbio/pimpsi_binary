@@ -8,31 +8,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import numpy as np
+
 from pimpsi.io import PimRecording
 from pimpsi.export import write_measurement_csv
-from pimpsi.measure import CSV_COLUMNS, DEFAULT_METRIC, MeasurementResult, measure_roi_toi
+from pimpsi.measure import DEFAULT_METRIC, MeasurementResult, measure_roi_toi
 from pimpsi.session import AnalysisSession
-
-
-CSV_COLUMNS = [
-    "source_file",
-    "source_sha256",
-    "file_version",
-    "roi_id",
-    "roi_label",
-    "toi_id",
-    "toi_label",
-    "frame_start",
-    "frame_end",
-    "metric",
-    "value",
-    "n_pixels",
-    "n_frames",
-    "coherence_factor",
-    "signal_gain",
-    "perfusion_clip_upper",
-    "negative_variance_policy",
-]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,6 +65,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="measure even if session source metadata does not match the binary",
     )
+    measure_parser.add_argument(
+        "--intensity-mask-lower",
+        type=float,
+        help="override the session and exclude pixels below this intensity",
+    )
+    measure_parser.add_argument(
+        "--intensity-mask-upper",
+        type=float,
+        help="override the session and exclude pixels above this intensity",
+    )
     measure_parser.set_defaults(handler=measure_command)
 
     gui_parser = subparsers.add_parser("gui", help="start the PySide6 viewer")
@@ -119,6 +110,7 @@ def measure_command(args: argparse.Namespace) -> None:
     if not session.tois:
         raise ValueError("session contains no TOIs")
 
+    intensity_mask = _intensity_mask_from_args_or_session(args, session)
     metrics = args.metric or [DEFAULT_METRIC]
     results: list[MeasurementResult] = []
     for roi in session.rois:
@@ -130,6 +122,7 @@ def measure_command(args: argparse.Namespace) -> None:
                         roi=roi,
                         toi=toi,
                         metric=metric,
+                        intensity_mask=intensity_mask,
                         perfusion_clip_upper=session.processing_profile.perfusion_clip_upper,
                         negative_variance_policy=session.processing_profile.negative_variance_policy,
                     )
@@ -188,6 +181,23 @@ def _validate_session_source(recording: PimRecording, session: AnalysisSession) 
             + ", ".join(mismatches)
             + "; pass --allow-source-mismatch to override"
         )
+
+
+def _intensity_mask_from_args_or_session(args: argparse.Namespace, session: AnalysisSession):
+    lower = args.intensity_mask_lower
+    upper = args.intensity_mask_upper
+    if (lower is None) != (upper is None):
+        raise ValueError("--intensity-mask-lower and --intensity-mask-upper must be passed together")
+    enabled = session.processing_profile.intensity_mask_enabled
+    if lower is None:
+        lower = session.processing_profile.intensity_mask_lower
+        upper = session.processing_profile.intensity_mask_upper
+    else:
+        enabled = True
+    if not enabled:
+        return None
+    lower, upper = min(lower, upper), max(lower, upper)
+    return lambda intensity: (np.asarray(intensity) >= lower) & (np.asarray(intensity) <= upper)
 
 
 def _write_measurements(path: Path, results: list[MeasurementResult]) -> None:

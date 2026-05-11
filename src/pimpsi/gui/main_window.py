@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,6 +29,23 @@ COLORMAPS = ["viridis", "gray", "inferno", "magma", "plasma", "turbo", "cividis"
 EXPORT_COLORMAPS = ["viridis", "inferno", "magma", "plasma", "turbo", "cividis"]
 
 
+@dataclass(frozen=True)
+class IntensityMaskSettings:
+    enabled: bool = False
+    lower: float = 0.0
+    upper: float = 1.0
+
+    def normalized(self) -> "IntensityMaskSettings":
+        return IntensityMaskSettings(
+            enabled=self.enabled,
+            lower=min(self.lower, self.upper),
+            upper=max(self.lower, self.upper),
+        )
+
+
+TraceCacheKey = tuple[str, str, tuple[tuple[float, float], ...], tuple[bool, float, float]]
+
+
 class ChannelWindow(QtWidgets.QMainWindow):
     """Independent channel/frame viewer sharing the same lazy recording API."""
 
@@ -42,7 +60,10 @@ class ChannelWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.recording = recording
         self.provider = LazyFrameProvider(recording)
-        self.roi_items: dict[str, pg.ROI] = {}
+        self.roi_items: dict[str, list[pg.PlotDataItem]] = {}
+        self._source_rois: list[Roi] = []
+        self.mask_settings = IntensityMaskSettings()
+        self.masked_roi_item: pg.ImageItem | None = None
         self.setWindowTitle(f"PIMSoft PSI - {channel}")
         self.resize(720, 520)
 
@@ -66,7 +87,12 @@ class ChannelWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(QtWidgets.QLabel("Frame"))
         toolbar.addWidget(self.frame_spin)
         self.addToolBar(toolbar)
-        self.setCentralWidget(self.image_view)
+        central = QtWidgets.QWidget()
+        central_layout = QtWidgets.QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.addWidget(_viewer_legend_label("Thick outline: ROI geometry | Bright outline: masked ROI"))
+        central_layout.addWidget(self.image_view, 1)
+        self.setCentralWidget(central)
 
         self.mode_combo.currentTextChanged.connect(self._channel_changed)
         self.colormap_combo.currentTextChanged.connect(self._set_colormap)
@@ -79,6 +105,7 @@ class ChannelWindow(QtWidgets.QMainWindow):
         channel = self.mode_combo.currentText()
         self.setWindowTitle(f"PIMSoft PSI - {channel}")
         self.image_view.set_image(self.provider.frame(channel, self.frame_spin.value() - 1))
+        self._refresh_masked_roi_overlay()
 
     def _set_colormap(self, name: str) -> None:
         self.image_view.set_colormap(name)
@@ -93,14 +120,30 @@ class ChannelWindow(QtWidgets.QMainWindow):
         self.frame_spin.blockSignals(False)
         self.refresh()
 
+    def set_mask_settings(self, settings: IntensityMaskSettings) -> None:
+        self.mask_settings = settings.normalized()
+        self._refresh_masked_roi_overlay()
+
     def set_rois(self, rois: list[Roi]) -> None:
-        for item in list(self.roi_items.values()):
-            self.image_view.remove_item(item)
+        self._source_rois = rois
+        for items in list(self.roi_items.values()):
+            _remove_graphics_items(self.image_view, items)
         self.roi_items.clear()
         for roi in rois:
-            item = _make_roi_item(roi, editable=False)
-            self.roi_items[roi.id] = item
-            self.image_view.add_item(item)
+            items = _make_roi_outline_items(roi, width=3)
+            self.roi_items[roi.id] = items
+            for item in items:
+                self.image_view.add_item(item)
+        self._refresh_masked_roi_overlay()
+
+    def _refresh_masked_roi_overlay(self) -> None:
+        overlay = _masked_roi_overlay(
+            self.recording,
+            [roi for roi in self._source_rois if roi.visible],
+            self.frame_spin.value() - 1,
+            self.mask_settings,
+        )
+        self.masked_roi_item = _set_overlay_image(self.image_view, self.masked_roi_item, overlay)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -119,14 +162,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_provider: LazyFrameProvider | None = None
         self.current_frame_index = 0
         self.roi_items: dict[str, pg.ROI] = {}
-        self.secondary_roi_items: dict[str, pg.ROI] = {}
+        self.secondary_roi_items: dict[str, list[pg.PlotDataItem]] = {}
         self.channel_windows: list[ChannelWindow] = []
         self._updating_tables = False
         self._syncing_roi_items = False
         self._armed_roi_shape: str | None = None
         self._roi_tool_filter_installed = False
-        self._trace_cache: dict[tuple[str, str, tuple[tuple[float, float], ...]], list[float]] = {}
+        self._trace_cache: dict[TraceCacheKey, list[float]] = {}
         self._dirty_trace_rois: set[str] = set()
+        self.intensity_mask_settings = IntensityMaskSettings()
+        self.top_masked_roi_item: pg.ImageItem | None = None
+        self.secondary_masked_roi_item: pg.ImageItem | None = None
         self._trace_update_timer = QtCore.QTimer(self)
         self._trace_update_timer.setSingleShot(True)
         self._trace_update_timer.setInterval(500)
@@ -137,6 +183,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.second_provider: LazyFrameProvider | None = None
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(CHANNELS)
+        self.mode_combo.setCurrentText("intensity")
+        self.mode_combo.setEnabled(False)
         self.secondary_mode_combo = QtWidgets.QComboBox()
         self.secondary_mode_combo.addItems(CHANNELS)
         self.secondary_mode_combo.setCurrentText("perfusion")
@@ -166,6 +214,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trace_channel_combo.setCurrentText("intensity")
         self.auto_trace_checkbox = QtWidgets.QCheckBox("Auto")
         self.auto_trace_checkbox.setChecked(True)
+        self.intensity_mask_checkbox = QtWidgets.QCheckBox("Intensity mask")
+        self.intensity_mask_lower_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.intensity_mask_upper_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.intensity_mask_lower_spin = QtWidgets.QDoubleSpinBox()
+        self.intensity_mask_upper_spin = QtWidgets.QDoubleSpinBox()
         self.trace_plot = pg.PlotWidget()
         self.trace_plot.setLabel("bottom", "Frame")
         self.trace_plot.setLabel("left", "Mean value")
@@ -249,13 +302,6 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.addAction(self.action_save_session)
         toolbar.addAction(self.action_new_channel)
         toolbar.addSeparator()
-        toolbar.addWidget(QtWidgets.QLabel("Top"))
-        toolbar.addWidget(self.mode_combo)
-        toolbar.addWidget(self.top_colormap_combo)
-        toolbar.addWidget(QtWidgets.QLabel("Bottom"))
-        toolbar.addWidget(self.secondary_mode_combo)
-        toolbar.addWidget(self.bottom_colormap_combo)
-        toolbar.addSeparator()
         toolbar.addWidget(QtWidgets.QLabel("Frame"))
         toolbar.addWidget(self.frame_spin)
         self.addToolBar(toolbar)
@@ -266,9 +312,34 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.frame_slider, 1)
         controls_layout.addWidget(self.status_label)
 
+        top_viewer = QtWidgets.QWidget()
+        top_viewer_layout = QtWidgets.QVBoxLayout(top_viewer)
+        top_viewer_layout.setContentsMargins(0, 0, 0, 0)
+        top_controls = QtWidgets.QHBoxLayout()
+        top_controls.addWidget(QtWidgets.QLabel("Top: Intensity"))
+        top_controls.addStretch(1)
+        top_controls.addWidget(QtWidgets.QLabel("Map"))
+        top_controls.addWidget(self.top_colormap_combo)
+        top_viewer_layout.addLayout(top_controls)
+        top_viewer_layout.addWidget(_viewer_legend_label("ROI handles: editable ROI | Bright outline: masked ROI"))
+        top_viewer_layout.addWidget(self.image_view, 1)
+
+        bottom_viewer = QtWidgets.QWidget()
+        bottom_viewer_layout = QtWidgets.QVBoxLayout(bottom_viewer)
+        bottom_viewer_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_controls = QtWidgets.QHBoxLayout()
+        bottom_controls.addWidget(QtWidgets.QLabel("Bottom"))
+        bottom_controls.addWidget(self.secondary_mode_combo)
+        bottom_controls.addStretch(1)
+        bottom_controls.addWidget(QtWidgets.QLabel("Map"))
+        bottom_controls.addWidget(self.bottom_colormap_combo)
+        bottom_viewer_layout.addLayout(bottom_controls)
+        bottom_viewer_layout.addWidget(_viewer_legend_label("Thick outline: ROI geometry | Bright outline: masked ROI"))
+        bottom_viewer_layout.addWidget(self.second_image_view, 1)
+
         image_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        image_splitter.addWidget(self.image_view)
-        image_splitter.addWidget(self.second_image_view)
+        image_splitter.addWidget(top_viewer)
+        image_splitter.addWidget(bottom_viewer)
         image_splitter.setStretchFactor(0, 1)
         image_splitter.setStretchFactor(1, 1)
 
@@ -300,7 +371,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _roi_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
-        buttons = QtWidgets.QHBoxLayout()
+        button_row = QtWidgets.QHBoxLayout()
+        add_box = QtWidgets.QGroupBox("Add")
+        add_layout = QtWidgets.QHBoxLayout(add_box)
+        edit_box = QtWidgets.QGroupBox("Edit")
+        edit_layout = QtWidgets.QHBoxLayout(edit_box)
         self.add_rect_button = QtWidgets.QToolButton()
         self.add_rect_button.setText("Rect")
         self.add_ellipse_button = QtWidgets.QToolButton()
@@ -311,17 +386,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.delete_roi_button.setText("Remove")
         self.color_roi_button = QtWidgets.QToolButton()
         self.color_roi_button.setText("Color")
-        for button in [
-            self.add_rect_button,
-            self.add_ellipse_button,
-            self.add_polygon_button,
-            self.color_roi_button,
-            self.delete_roi_button,
-        ]:
-            if button in {self.add_rect_button, self.add_ellipse_button, self.add_polygon_button}:
-                button.setCheckable(True)
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
+        for button in [self.add_rect_button, self.add_ellipse_button, self.add_polygon_button]:
+            button.setCheckable(True)
+            add_layout.addWidget(button)
+        for button in [self.color_roi_button, self.delete_roi_button]:
+            edit_layout.addWidget(button)
+        button_row.addWidget(add_box)
+        button_row.addWidget(edit_box)
+        layout.addLayout(button_row)
         layout.addWidget(self.roi_table, 1)
         return panel
 
@@ -352,8 +424,247 @@ class MainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.auto_trace_checkbox)
         controls.addWidget(self.update_trace_button)
         layout.addLayout(controls)
+        mask_box = QtWidgets.QGroupBox("Masked ROI")
+        mask_layout = QtWidgets.QFormLayout(mask_box)
+        mask_layout.addRow(self.intensity_mask_checkbox)
+        mask_layout.addRow("Lower", self._mask_bound_row(self.intensity_mask_lower_slider, self.intensity_mask_lower_spin))
+        mask_layout.addRow("Upper", self._mask_bound_row(self.intensity_mask_upper_slider, self.intensity_mask_upper_spin))
+        mask_note = QtWidgets.QLabel("Pixels outside the intensity range are excluded per frame.")
+        mask_note.setWordWrap(True)
+        mask_layout.addRow(mask_note)
+        layout.addWidget(mask_box)
         layout.addWidget(self.trace_plot, 1)
+        self._configure_intensity_mask_controls(
+            self.intensity_mask_checkbox,
+            self.intensity_mask_lower_slider,
+            self.intensity_mask_lower_spin,
+            self.intensity_mask_upper_slider,
+            self.intensity_mask_upper_spin,
+            self.intensity_mask_settings,
+            self._trace_mask_controls_changed,
+        )
         return panel
+
+    def _mask_bound_row(
+        self,
+        slider: QtWidgets.QSlider,
+        spin: QtWidgets.QDoubleSpinBox,
+    ) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(slider, 1)
+        layout.addWidget(spin)
+        return row
+
+    def _configure_intensity_mask_controls(
+        self,
+        enabled_check: QtWidgets.QCheckBox,
+        lower_slider: QtWidgets.QSlider,
+        lower_spin: QtWidgets.QDoubleSpinBox,
+        upper_slider: QtWidgets.QSlider,
+        upper_spin: QtWidgets.QDoubleSpinBox,
+        settings: IntensityMaskSettings,
+        changed_callback,
+    ) -> None:
+        low_range, high_range = self._intensity_range_defaults()
+        if high_range <= low_range:
+            high_range = low_range + 1.0
+        for slider in [lower_slider, upper_slider]:
+            slider.setRange(0, 1000)
+        for spin in [lower_spin, upper_spin]:
+            spin.setDecimals(3)
+            spin.setRange(low_range, high_range)
+            spin.setSingleStep(max((high_range - low_range) / 100.0, 0.001))
+
+        settings = settings.normalized()
+        lower = _clamp(settings.lower, low_range, high_range)
+        upper = _clamp(settings.upper, low_range, high_range)
+        if not settings.enabled and settings.lower == settings.upper:
+            lower, upper = low_range, high_range
+
+        syncing = {"value": False}
+
+        def slider_from_value(value: float) -> int:
+            low_range = lower_spin.minimum()
+            high_range = lower_spin.maximum()
+            return _clamp_int(round(((value - low_range) / (high_range - low_range)) * 1000), 0, 1000)
+
+        def value_from_slider(value: int) -> float:
+            low_range = lower_spin.minimum()
+            high_range = lower_spin.maximum()
+            return low_range + ((high_range - low_range) * (value / 1000.0))
+
+        def set_enabled_state() -> None:
+            enabled = enabled_check.isChecked()
+            for widget in [lower_slider, lower_spin, upper_slider, upper_spin]:
+                widget.setEnabled(enabled)
+
+        def emit_changed() -> None:
+            if syncing["value"]:
+                return
+            set_enabled_state()
+            changed_callback(
+                IntensityMaskSettings(
+                    enabled=enabled_check.isChecked(),
+                    lower=lower_spin.value(),
+                    upper=upper_spin.value(),
+                ).normalized()
+            )
+
+        def slider_changed() -> None:
+            if syncing["value"]:
+                return
+            syncing["value"] = True
+            lower_spin.setValue(value_from_slider(lower_slider.value()))
+            upper_spin.setValue(value_from_slider(upper_slider.value()))
+            syncing["value"] = False
+            emit_changed()
+
+        def spin_changed() -> None:
+            if syncing["value"]:
+                return
+            syncing["value"] = True
+            lower_slider.setValue(slider_from_value(lower_spin.value()))
+            upper_slider.setValue(slider_from_value(upper_spin.value()))
+            syncing["value"] = False
+            emit_changed()
+
+        syncing["value"] = True
+        enabled_check.setChecked(settings.enabled)
+        lower_spin.setValue(lower)
+        upper_spin.setValue(upper)
+        lower_slider.setValue(slider_from_value(lower))
+        upper_slider.setValue(slider_from_value(upper))
+        syncing["value"] = False
+        set_enabled_state()
+
+        enabled_check.toggled.connect(lambda _checked: emit_changed())
+        lower_slider.valueChanged.connect(lambda _value: slider_changed())
+        upper_slider.valueChanged.connect(lambda _value: slider_changed())
+        lower_spin.valueChanged.connect(lambda _value: spin_changed())
+        upper_spin.valueChanged.connect(lambda _value: spin_changed())
+
+    def _intensity_range_defaults(self) -> tuple[float, float]:
+        if self.recording is None:
+            return 0.0, 1.0
+        try:
+            image = self.recording.get_intensity(self.current_frame_index)
+        except Exception:
+            return 0.0, 1.0
+        finite = image[np.isfinite(image)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        return float(np.min(finite)), float(np.max(finite))
+
+    def _trace_mask_controls_changed(self, settings: IntensityMaskSettings) -> None:
+        self.intensity_mask_settings = settings.normalized()
+        self._write_mask_settings_to_session()
+        self._trace_cache.clear()
+        self._refresh_masked_roi_overlays()
+        self._sync_channel_window_mask_settings()
+        self._maybe_update_trace()
+
+    def _reset_trace_mask_controls_to_intensity_range(self) -> None:
+        low, high = self._intensity_range_defaults()
+        if high <= low:
+            high = low + 1.0
+        self._set_trace_mask_controls(IntensityMaskSettings(False, low, high), range_defaults=(low, high))
+        self._write_mask_settings_to_session()
+
+    def _set_trace_mask_controls(
+        self,
+        settings: IntensityMaskSettings,
+        range_defaults: tuple[float, float] | None = None,
+    ) -> None:
+        low, high = range_defaults or self._intensity_range_defaults()
+        settings = settings.normalized()
+        low = min(low, settings.lower)
+        high = max(high, settings.upper)
+        if high <= low:
+            high = low + 1.0
+        self.intensity_mask_settings = settings
+        for widget in [
+            self.intensity_mask_checkbox,
+            self.intensity_mask_lower_slider,
+            self.intensity_mask_upper_slider,
+            self.intensity_mask_lower_spin,
+            self.intensity_mask_upper_spin,
+        ]:
+            widget.blockSignals(True)
+        try:
+            self.intensity_mask_checkbox.setChecked(settings.enabled)
+            for spin in [self.intensity_mask_lower_spin, self.intensity_mask_upper_spin]:
+                spin.setRange(low, high)
+                spin.setSingleStep(max((high - low) / 100.0, 0.001))
+            self.intensity_mask_lower_spin.setValue(settings.lower)
+            self.intensity_mask_upper_spin.setValue(settings.upper)
+            self.intensity_mask_lower_slider.setValue(_slider_from_range_value(settings.lower, low, high))
+            self.intensity_mask_upper_slider.setValue(_slider_from_range_value(settings.upper, low, high))
+            for widget in [
+                self.intensity_mask_lower_slider,
+                self.intensity_mask_upper_slider,
+                self.intensity_mask_lower_spin,
+                self.intensity_mask_upper_spin,
+            ]:
+                widget.setEnabled(settings.enabled)
+        finally:
+            for widget in [
+                self.intensity_mask_checkbox,
+                self.intensity_mask_lower_slider,
+                self.intensity_mask_upper_slider,
+                self.intensity_mask_lower_spin,
+                self.intensity_mask_upper_spin,
+            ]:
+                widget.blockSignals(False)
+
+    def _mask_settings_from_session(self) -> IntensityMaskSettings:
+        if self.session is None:
+            return self.intensity_mask_settings
+        profile = self.session.processing_profile
+        return IntensityMaskSettings(
+            enabled=profile.intensity_mask_enabled,
+            lower=profile.intensity_mask_lower,
+            upper=profile.intensity_mask_upper,
+        ).normalized()
+
+    def _write_mask_settings_to_session(self) -> None:
+        if self.session is None:
+            return
+        settings = self.intensity_mask_settings.normalized()
+        profile = self.session.processing_profile
+        profile.intensity_mask_enabled = settings.enabled
+        profile.intensity_mask_lower = settings.lower
+        profile.intensity_mask_upper = settings.upper
+
+    def _dialog_intensity_mask_box(
+        self,
+        settings: IntensityMaskSettings,
+        note_text: str,
+    ) -> tuple[QtWidgets.QGroupBox, QtWidgets.QCheckBox, QtWidgets.QDoubleSpinBox, QtWidgets.QDoubleSpinBox]:
+        box = QtWidgets.QGroupBox("Intensity Mask")
+        layout = QtWidgets.QFormLayout(box)
+        check = QtWidgets.QCheckBox("Apply intensity mask")
+        note = QtWidgets.QLabel(note_text)
+        note.setWordWrap(True)
+        lower_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        upper_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        lower_spin = QtWidgets.QDoubleSpinBox()
+        upper_spin = QtWidgets.QDoubleSpinBox()
+        layout.addRow(check)
+        layout.addRow("Lower", self._mask_bound_row(lower_slider, lower_spin))
+        layout.addRow("Upper", self._mask_bound_row(upper_slider, upper_spin))
+        layout.addRow(note)
+        self._configure_intensity_mask_controls(
+            check,
+            lower_slider,
+            lower_spin,
+            upper_slider,
+            upper_spin,
+            settings,
+            lambda _settings: None,
+        )
+        return box, check, lower_spin, upper_spin
 
     def _connect_signals(self) -> None:
         self.action_open.triggered.connect(self._choose_recording)
@@ -438,7 +749,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.instance().installEventFilter(self)
             self._roi_tool_filter_installed = True
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.CrossCursor)
-        self.statusBar().showMessage("Click a channel view to place the ROI, or press Esc to cancel.")
+        self.statusBar().showMessage("Click the top intensity view to place the ROI, or press Esc to cancel.")
 
     def cancel_roi_tool(self) -> None:
         self._armed_roi_shape = None
@@ -464,11 +775,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _view_for_scene(self, scene: QtCore.QObject) -> ImageView | None:
         if scene is self.image_view._view.scene:
             return self.image_view
-        if scene is self.second_image_view._view.scene:
-            return self.second_image_view
         return None
 
     def _top_channel_changed(self) -> None:
+        if self.mode_combo.currentText() != "intensity":
+            self.mode_combo.setCurrentText("intensity")
+            return
         self.image_view.reset_levels()
         self._refresh_current_frame()
 
@@ -502,6 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.frame_slider.blockSignals(False)
         self.frame_spin.blockSignals(False)
 
+        self._reset_trace_mask_controls_to_intensity_range()
         self._populate_metadata()
         self._sync_tables_from_session()
         self.image_view.reset_levels()
@@ -520,6 +833,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.session = AnalysisSession.load(path)
         self.session_path = Path(path)
+        self._set_trace_mask_controls(self._mask_settings_from_session())
         self._sync_tables_from_session()
         self._refresh_roi_items()
         self._sync_channel_window_rois()
@@ -612,7 +926,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.image_view.remove_item(item)
             item = self.secondary_roi_items.pop(roi_id, None)
             if item is not None:
-                self.second_image_view.remove_item(item)
+                _remove_graphics_items(self.second_image_view, item)
         self._sync_tables_from_session()
         self._maybe_update_trace()
         self._sync_channel_window_rois()
@@ -680,11 +994,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         window = ChannelWindow(
             self.recording,
-            channel=self.mode_combo.currentText(),
+            channel=self.secondary_mode_combo.currentText(),
             frame_index=self.current_frame_index,
-            colormap=self.top_colormap_combo.currentText(),
+            colormap=self.bottom_colormap_combo.currentText(),
             rois=self.session.rois if self.session is not None else [],
         )
+        window.set_mask_settings(self.intensity_mask_settings)
         self.channel_windows.append(window)
         self.frame_changed.connect(window.set_frame)
         window.destroyed.connect(lambda: self.channel_windows.remove(window) if window in self.channel_windows else None)
@@ -720,6 +1035,7 @@ class MainWindow(QtWidgets.QMainWindow):
             colormap=options["colormap"],
             color_limits=options["color_limits"],
             rois=options["rois"] if options["draw_rois"] else [],
+            intensity_mask=_intensity_mask_callback(options["mask_settings"]) if options["draw_rois"] else None,
         )
         self.statusBar().showMessage(f"Exported {len(exported)} image file(s) to {directory}", 5000)
 
@@ -748,8 +1064,10 @@ class MainWindow(QtWidgets.QMainWindow):
         directory = self._choose_export_directory("Export Measurements")
         if directory is None:
             return
-        path = directory / f"{self.recording.path.stem}_measurements.csv"
+        suffix = "_masked_measurements.csv" if options["mask_settings"].enabled else "_measurements.csv"
+        path = directory / f"{self.recording.path.stem}{suffix}"
         self._sync_session_from_roi_items()
+        intensity_mask = _intensity_mask_callback(options["mask_settings"])
         results = []
         for roi in options["rois"]:
             for toi in options["tois"]:
@@ -760,6 +1078,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             roi,
                             toi,
                             metric=metric,
+                            intensity_mask=intensity_mask,
                             perfusion_clip_upper=self.session.processing_profile.perfusion_clip_upper,
                         )
                     )
@@ -769,6 +1088,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.recording,
                         roi,
                         frames=options["frames"],
+                        intensity_mask=intensity_mask,
                         perfusion_clip_upper=self.session.processing_profile.perfusion_clip_upper,
                     )
                 )
@@ -878,15 +1198,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_current_frame(self) -> None:
         if self.recording is None or self.frame_provider is None or self.second_provider is None:
             return
-        top_mode = self.mode_combo.currentText()
+        top_mode = "intensity"
         bottom_mode = self.secondary_mode_combo.currentText()
         top_image = self.frame_provider.frame(top_mode, self.current_frame_index)
         bottom_image = self.second_provider.frame(bottom_mode, self.current_frame_index)
         self.image_view.set_image(top_image)
         self.second_image_view.set_image(bottom_image)
+        self._refresh_masked_roi_overlays()
         self.status_label.setText(
             f"{self.current_frame_index + 1}/{self.recording.header.n_frames} | "
-            f"top {top_mode} | bottom {bottom_mode}"
+            f"top intensity | bottom {bottom_mode}"
         )
         self.frame_changed.emit(self.current_frame_index)
 
@@ -895,10 +1216,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.roi_items[roi.id] = item
         self.image_view.add_item(item)
         item.sigRegionChanged.connect(lambda _=None, roi_id=roi.id: self._roi_item_changed(roi_id, "top"))
-        secondary_item = _make_roi_item(roi, editable=True)
-        self.secondary_roi_items[roi.id] = secondary_item
-        self.second_image_view.add_item(secondary_item)
-        secondary_item.sigRegionChanged.connect(lambda _=None, roi_id=roi.id: self._roi_item_changed(roi_id, "bottom"))
+        secondary_items = _make_roi_outline_items(roi, width=3)
+        self.secondary_roi_items[roi.id] = secondary_items
+        for secondary_item in secondary_items:
+            self.second_image_view.add_item(secondary_item)
 
     def _roi_item_changed(self, roi_id: str, source: str) -> None:
         if self.session is None:
@@ -931,20 +1252,18 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self.roi_items.clear()
-        for item in list(self.secondary_roi_items.values()):
-            try:
-                self.second_image_view.remove_item(item)
-            except Exception:
-                pass
+        for items in list(self.secondary_roi_items.values()):
+            _remove_graphics_items(self.second_image_view, items)
         self.secondary_roi_items.clear()
+        self.top_masked_roi_item = _set_overlay_image(self.image_view, self.top_masked_roi_item, None)
+        self.secondary_masked_roi_item = _set_overlay_image(self.second_image_view, self.secondary_masked_roi_item, None)
 
     def _sync_roi_item_geometry(self, roi: Roi, source: str | None = None) -> None:
         targets = []
         if source != "top" and roi.id in self.roi_items:
             targets.append(self.roi_items[roi.id])
-        if source != "bottom" and roi.id in self.secondary_roi_items:
-            targets.append(self.secondary_roi_items[roi.id])
         if not targets:
+            self._refresh_secondary_roi_outline(roi)
             return
         self._syncing_roi_items = True
         try:
@@ -952,11 +1271,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 _set_roi_item_geometry(item, roi)
         finally:
             self._syncing_roi_items = False
+        self._refresh_secondary_roi_outline(roi)
+
+    def _refresh_secondary_roi_outline(self, roi: Roi) -> None:
+        old_items = self.secondary_roi_items.pop(roi.id, [])
+        _remove_graphics_items(self.second_image_view, old_items)
+        new_items = _make_roi_outline_items(roi, width=3)
+        self.secondary_roi_items[roi.id] = new_items
+        for item in new_items:
+            self.second_image_view.add_item(item)
 
     def _sync_channel_window_rois(self) -> None:
         rois = self.session.rois if self.session is not None else []
         for window in list(self.channel_windows):
             window.set_rois(rois)
+            window.set_mask_settings(self.intensity_mask_settings)
+        self._refresh_masked_roi_overlays()
+
+    def _sync_channel_window_mask_settings(self) -> None:
+        for window in list(self.channel_windows):
+            window.set_mask_settings(self.intensity_mask_settings)
+
+    def _refresh_masked_roi_overlays(self) -> None:
+        rois = [roi for roi in self.session.rois if roi.visible] if self.session is not None else []
+        overlay = (
+            _masked_roi_overlay(
+                self.recording,
+                rois,
+                self.current_frame_index,
+                self.intensity_mask_settings,
+            )
+            if self.recording is not None
+            else None
+        )
+        self.top_masked_roi_item = _set_overlay_image(
+            self.image_view,
+            self.top_masked_roi_item,
+            overlay,
+        )
+        self.secondary_masked_roi_item = _set_overlay_image(
+            self.second_image_view,
+            self.secondary_masked_roi_item,
+            overlay,
+        )
 
     def _sync_tables_from_session(self) -> None:
         self._updating_tables = True
@@ -1021,10 +1378,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if roi_item is not None:
             roi_item.setVisible(roi.visible)
             roi_item.setPen(pg.mkPen(roi.color, width=2))
-        secondary_item = self.secondary_roi_items.get(roi.id)
-        if secondary_item is not None:
-            secondary_item.setVisible(roi.visible)
-            secondary_item.setPen(pg.mkPen(roi.color, width=2))
+        self._refresh_secondary_roi_outline(roi)
         self._sync_channel_window_rois()
         self._maybe_update_trace()
 
@@ -1035,17 +1389,43 @@ class MainWindow(QtWidgets.QMainWindow):
         trace_frames: list[int],
         provider: LazyFrameProvider,
     ) -> list[float]:
-        cache_key = (roi.id, channel, _roi_geometry_signature(roi))
+        mask_settings = self.intensity_mask_settings.normalized()
+        cache_key = (roi.id, channel, _roi_geometry_signature(roi), _mask_settings_signature(mask_settings))
         if roi.id not in self._dirty_trace_rois and cache_key in self._trace_cache:
             return self._trace_cache[cache_key]
 
         if self.recording is None:
             return []
         mask = roi.to_mask((self.recording.header.image_height, self.recording.header.image_width))
+        if channel == "perfusion":
+            if not mask.any():
+                values = [np.nan] * len(trace_frames)
+            else:
+                values = [
+                    result.value
+                    for result in measure_roi_per_frame(
+                        self.recording,
+                        roi,
+                        frames=trace_frames,
+                        intensity_mask=_intensity_mask_callback(mask_settings),
+                        perfusion_clip_upper=self.session.processing_profile.perfusion_clip_upper
+                        if self.session is not None
+                        else 3000.0,
+                    )
+                ]
+            self._drop_trace_cache_for_roi(roi.id, channel=channel)
+            self._trace_cache[cache_key] = values
+            self._dirty_trace_rois.discard(roi.id)
+            return values
+
         values = []
         for frame_index in trace_frames:
             image = provider.frame(channel, frame_index)
-            values.append(float(image[mask].mean()) if mask.any() else np.nan)
+            valid_mask = mask
+            if mask_settings.enabled:
+                intensity = self.recording.get_intensity(frame_index)
+                valid_mask = mask & _intensity_inclusion_mask(intensity, mask_settings)
+            values.append(float(image[valid_mask].mean()) if valid_mask.any() else np.nan)
         self._drop_trace_cache_for_roi(roi.id, channel=channel)
         self._trace_cache[cache_key] = values
         self._dirty_trace_rois.discard(roi.id)
@@ -1410,6 +1790,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Image Export Options")
         layout = QtWidgets.QVBoxLayout(dialog)
+        content = QtWidgets.QHBoxLayout()
+        left_column = QtWidgets.QVBoxLayout()
+        right_column = QtWidgets.QVBoxLayout()
+        content.addLayout(left_column, 1)
+        content.addLayout(right_column, 1)
+        layout.addLayout(content)
 
         frame_box = QtWidgets.QGroupBox("Frames")
         frame_layout = QtWidgets.QFormLayout(frame_box)
@@ -1425,7 +1811,7 @@ class MainWindow(QtWidgets.QMainWindow):
             end_slider=end_slider,
             end_spin=end_spin,
         )
-        layout.addWidget(frame_box)
+        left_column.addWidget(frame_box)
 
         channel_checks = []
         channel_combo = QtWidgets.QComboBox()
@@ -1438,7 +1824,7 @@ class MainWindow(QtWidgets.QMainWindow):
             channel_checks.append(check)
             channel_combo.addItem(channel)
         channel_combo.setCurrentText(self.mode_combo.currentText())
-        layout.addWidget(channel_box)
+        left_column.addWidget(channel_box)
 
         option_box = QtWidgets.QGroupBox("Options")
         option_layout = QtWidgets.QVBoxLayout(option_box)
@@ -1462,9 +1848,10 @@ class MainWindow(QtWidgets.QMainWindow):
         image_variant_layout.addWidget(color_check)
         image_variant_layout.addWidget(color_note)
         option_layout.addWidget(image_variant_box)
-        layout.addWidget(option_box)
+        left_column.addWidget(option_box)
+        left_column.addStretch(1)
         scale_box, low_spin, high_spin, color_settings, save_color_settings = self._add_color_scale_controls(
-            layout,
+            right_column,
             channel_combo,
             colormap_combo,
         )
@@ -1503,7 +1890,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 roi_checks.append((check, roi))
         else:
             roi_layout.addWidget(QtWidgets.QLabel("No ROIs available"))
-        layout.addWidget(roi_box)
+        right_column.addWidget(roi_box)
+        mask_box, mask_check, mask_low_spin, mask_high_spin = self._dialog_intensity_mask_box(
+            self.intensity_mask_settings,
+            "Draw masked ROI outlines using the same per-frame intensity inclusion rule as the trace.",
+        )
+        right_column.addWidget(mask_box)
+        right_column.addStretch(1)
 
         def update_color_options() -> None:
             has_rgb_source = single_check.isChecked() or averaged_check.isChecked()
@@ -1517,6 +1910,7 @@ class MainWindow(QtWidgets.QMainWindow):
             scale_box.setEnabled(enabled)
             roi_check.setEnabled(enabled)
             roi_box.setEnabled(enabled and roi_check.isChecked())
+            mask_box.setEnabled(enabled and roi_check.isChecked())
 
         single_check.toggled.connect(update_color_options)
         stacked_check.toggled.connect(update_color_options)
@@ -1531,7 +1925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        self._set_fixed_dialog_width(dialog, "Image Export Options")
+        self._set_fixed_dialog_width(dialog, "Image Export Options", minimum=780)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
         start = min(start_spin.value(), end_spin.value())
@@ -1575,6 +1969,11 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         draw_rois = color and roi_check.isChecked()
         rois = [roi for check, roi in roi_checks if check.isChecked()]
+        mask_settings = IntensityMaskSettings(
+            enabled=draw_rois and mask_check.isChecked(),
+            lower=mask_low_spin.value(),
+            upper=mask_high_spin.value(),
+        ).normalized()
         return {
             "frames": list(range(start, end + 1)),
             "channels": channels,
@@ -1586,6 +1985,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "color_limits": color_limits if color else None,
             "draw_rois": draw_rois,
             "rois": rois,
+            "mask_settings": mask_settings,
         }
 
     def _roi_mask_export_options(self) -> list[Roi] | None:
@@ -1663,6 +2063,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Measurement Export Options")
         layout = QtWidgets.QVBoxLayout(dialog)
+        content = QtWidgets.QHBoxLayout()
+        left_column = QtWidgets.QVBoxLayout()
+        right_column = QtWidgets.QVBoxLayout()
+        content.addLayout(left_column, 1)
+        content.addLayout(right_column, 1)
+        layout.addLayout(content)
         frame_box = QtWidgets.QGroupBox("Frames")
         frame_layout = QtWidgets.QFormLayout(frame_box)
         start_slider, start_spin, end_slider, end_spin = self._add_frame_range_controls(
@@ -1677,7 +2083,7 @@ class MainWindow(QtWidgets.QMainWindow):
             end_slider=end_slider,
             end_spin=end_spin,
         )
-        layout.addWidget(frame_box)
+        left_column.addWidget(frame_box)
         roi_checks = []
         metric_checks = []
         roi_box = QtWidgets.QGroupBox("ROIs")
@@ -1688,7 +2094,8 @@ class MainWindow(QtWidgets.QMainWindow):
             check.setChecked(not selected or roi.id in selected)
             roi_layout.addWidget(check)
             roi_checks.append((check, roi))
-        layout.addWidget(roi_box)
+        left_column.addWidget(roi_box)
+        left_column.addStretch(1)
         channel_box = QtWidgets.QGroupBox("Channels")
         channel_layout = QtWidgets.QVBoxLayout(channel_box)
         for label, metric in [
@@ -1700,7 +2107,7 @@ class MainWindow(QtWidgets.QMainWindow):
             check.setChecked(label == "Perfusion")
             channel_layout.addWidget(check)
             metric_checks.append((check, metric))
-        layout.addWidget(channel_box)
+        right_column.addWidget(channel_box)
         table_box = QtWidgets.QGroupBox("Tables")
         table_layout = QtWidgets.QVBoxLayout(table_box)
         averaged_check = QtWidgets.QCheckBox("Averaged measurement table")
@@ -1715,14 +2122,20 @@ class MainWindow(QtWidgets.QMainWindow):
         table_layout.addWidget(averaged_check)
         table_layout.addWidget(frame_by_frame_check)
         table_layout.addWidget(note)
-        layout.addWidget(table_box)
+        right_column.addWidget(table_box)
+        mask_box, mask_check, mask_low_spin, mask_high_spin = self._dialog_intensity_mask_box(
+            self.intensity_mask_settings,
+            "When enabled, pixels outside the intensity range are excluded per frame for trace and CSV measurements.",
+        )
+        right_column.addWidget(mask_box)
+        right_column.addStretch(1)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        self._set_fixed_dialog_width(dialog, "Measurement Export Options")
+        self._set_fixed_dialog_width(dialog, "Measurement Export Options", minimum=760)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
         rois = [roi for check, roi in roi_checks if check.isChecked()]
@@ -1739,12 +2152,18 @@ class MainWindow(QtWidgets.QMainWindow):
         start = min(start_spin.value(), end_spin.value()) - 1
         end = max(start_spin.value(), end_spin.value()) - 1
         toi = Toi(id="export_frames", label="Export frames", frame_start=start, frame_end=end, include_end=True)
+        mask_settings = IntensityMaskSettings(
+            enabled=mask_check.isChecked(),
+            lower=mask_low_spin.value(),
+            upper=mask_high_spin.value(),
+        ).normalized()
         return {
             "rois": rois,
             "tois": [toi] if averaged_check.isChecked() else [],
             "metrics": metrics,
             "frames": list(range(start, end + 1)),
             "frame_by_frame": frame_by_frame_check.isChecked(),
+            "mask_settings": mask_settings,
         }
 
     def _roi_by_id(self, roi_id: str) -> Roi | None:
@@ -1781,12 +2200,101 @@ def _roi_geometry_signature(roi: Roi) -> tuple[tuple[float, float], ...]:
     return tuple((round(x, 3), round(y, 3)) for x, y in roi.vertices_xy)
 
 
+def _mask_settings_signature(settings: IntensityMaskSettings) -> tuple[bool, float, float]:
+    settings = settings.normalized()
+    return settings.enabled, round(settings.lower, 6), round(settings.upper, 6)
+
+
+def _intensity_inclusion_mask(image: np.ndarray, settings: IntensityMaskSettings) -> np.ndarray:
+    settings = settings.normalized()
+    return (image >= settings.lower) & (image <= settings.upper)
+
+
+def _intensity_mask_callback(settings: IntensityMaskSettings):
+    settings = settings.normalized()
+    if not settings.enabled:
+        return None
+    return lambda intensity: _intensity_inclusion_mask(intensity, settings)
+
+
+def _masked_roi_overlay(
+    recording: PimRecording | None,
+    rois: list[Roi],
+    frame_index: int,
+    settings: IntensityMaskSettings,
+) -> np.ndarray | None:
+    settings = settings.normalized()
+    if recording is None or not settings.enabled or not rois:
+        return None
+    intensity = recording.get_intensity(frame_index)
+    intensity_mask = _intensity_inclusion_mask(intensity, settings)
+    overlay = np.zeros((*intensity.shape, 4), dtype=np.ubyte)
+    for roi in rois:
+        masked_roi = roi.to_mask(intensity.shape) & intensity_mask
+        boundary = _mask_boundary(masked_roi)
+        if not boundary.any():
+            continue
+        rgb = _hex_to_rgb(roi.color)
+        overlay[boundary] = (*rgb, 255)
+    return overlay if overlay[..., 3].any() else None
+
+
+def _set_overlay_image(
+    image_view: ImageView,
+    item: pg.ImageItem | None,
+    overlay: np.ndarray | None,
+) -> pg.ImageItem | None:
+    if overlay is None:
+        if item is not None:
+            try:
+                image_view.remove_item(item)
+            except Exception:
+                pass
+        return None
+    if item is None:
+        item = pg.ImageItem()
+        item.setZValue(50)
+        item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        image_view.add_item(item)
+    item.setImage(overlay, autoLevels=False, axisOrder="row-major")
+    return item
+
+
+def _mask_boundary(mask: np.ndarray) -> np.ndarray:
+    neighbors = np.zeros_like(mask, dtype=np.uint8)
+    neighbors[1:, :] += mask[:-1, :]
+    neighbors[:-1, :] += mask[1:, :]
+    neighbors[:, 1:] += mask[:, :-1]
+    neighbors[:, :-1] += mask[:, 1:]
+    return mask & (neighbors < 4)
+
+
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    if len(value) != 6:
+        return (255, 255, 255)
+    return tuple(int(value[index : index + 2], 16) for index in (0, 2, 4))
+
+
+def _viewer_legend_label(text: str) -> QtWidgets.QLabel:
+    label = QtWidgets.QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet("color: #334155; padding: 2px 4px;")
+    return label
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
 
 
 def _clamp_int(value: int, low: int, high: int) -> int:
     return min(max(value, low), high)
+
+
+def _slider_from_range_value(value: float, low: float, high: float) -> int:
+    if high <= low:
+        return 0
+    return _clamp_int(round(((value - low) / (high - low)) * 1000), 0, 1000)
 
 
 def _make_roi_item(roi: Roi, *, editable: bool) -> pg.ROI:
@@ -1805,6 +2313,51 @@ def _make_roi_item(roi: Roi, *, editable: bool) -> pg.ROI:
         for handle in item.getHandles():
             handle.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
     return item
+
+
+def _make_roi_outline_items(roi: Roi, *, width: int) -> list[pg.PlotDataItem]:
+    if not roi.visible:
+        return []
+    x_values, y_values = _roi_outline_points(roi)
+    item = pg.PlotDataItem(
+        x_values,
+        y_values,
+        pen=pg.mkPen(roi.color, width=width),
+        connect="all",
+    )
+    item.setZValue(40)
+    item.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+    return [item]
+
+
+def _roi_outline_points(roi: Roi) -> tuple[list[float], list[float]]:
+    if roi.shape_type == "ellipse":
+        left, top, right, bottom = _bounds(roi.vertices_xy)
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+        radius_x = (right - left) / 2.0
+        radius_y = (bottom - top) / 2.0
+        angles = np.linspace(0.0, 2.0 * np.pi, 97)
+        return (
+            [float(center_x + radius_x * np.cos(angle)) for angle in angles],
+            [float(center_y + radius_y * np.sin(angle)) for angle in angles],
+        )
+    if roi.shape_type == "rectangle":
+        left, top, right, bottom = _bounds(roi.vertices_xy)
+        points = [(left, top), (right, top), (right, bottom), (left, bottom), (left, top)]
+    else:
+        points = list(roi.vertices_xy)
+        if points and points[0] != points[-1]:
+            points.append(points[0])
+    return [float(x) for x, _ in points], [float(y) for _, y in points]
+
+
+def _remove_graphics_items(image_view: ImageView, items) -> None:
+    for item in items:
+        try:
+            image_view.remove_item(item)
+        except Exception:
+            pass
 
 
 def _set_roi_item_geometry(item: pg.ROI, roi: Roi) -> None:
