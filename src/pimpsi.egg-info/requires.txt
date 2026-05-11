@@ -1,0 +1,10 @@
+numpy
+
+[gui]
+PySide6
+imageio
+pyqtgraph
+tifffile
+
+[test]
+pytest
